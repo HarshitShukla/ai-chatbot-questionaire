@@ -1,6 +1,6 @@
 import streamlit as st
-import google.generativeai as genai
 import requests, io, json, base64, pandas as pd
+from google import genai
 from streamlit_lottie import st_lottie
 from gtts import gTTS
 from fpdf import FPDF
