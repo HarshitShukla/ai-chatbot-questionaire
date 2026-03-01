@@ -1,0 +1,8 @@
+streamlit
+google-generativeai
+streamlit-lottie
+requests
+gTTS
+pandas
+fpdf2
+st-gsheets-connection
