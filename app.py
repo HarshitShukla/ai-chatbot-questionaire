@@ -11,20 +11,44 @@ from streamlit_gsheets import GSheetsConnection
 # --- SETUP ---
 st.set_page_config(page_title="Sirosri AI", page_icon="🤖")
 
+# The genai client/chat objects hold onto a network connection.  Streamlit
+# reruns the script frequently, which can leave an instance in a "closed"
+# state when it is stored in session_state.  The mysterious "client closed"
+# exception comes from trying to reuse such an object.  To avoid it we create
+# the client/chat on demand and recreate them if they are missing or have been
+# closed.
 
-client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+def _init_genai():
+    """Return a fresh (or cached) chat instance.
+
+    The Chat object is stored in :data:`st.session_state` so that the history
+    is preserved between reruns, but the underlying http transport may be
+    closed by the library if Streamlit tears down the state.  This helper
+    ensures we always have a usable object.
+    """
+    if "_genai_client" not in st.session_state:
+        st.session_state._genai_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+
+    # if the chat instance is missing (first run) or we've detected a send
+    # failure previously, rebuild it.  For simplicity we just recreate whenever
+    # it isn't present.
+    if "chat" not in st.session_state:
+        st.session_state.chat = st.session_state._genai_client.chats.create(model="gemini-2.5-flash")
+
+    return st.session_state.chat
+
 # Securely load API Key from Secrets
-try:
-    conn = st.connection("gsheets", type=GSheetsConnection)
-except Exception as e:
-    st.error("Setup Error: Check your secrets.toml gsheet file!")
+#try:
+#    conn = st.connection("gsheets", type=GSheetsConnection)
+#except Exception as e:
+#    st.error("Setup Error: Check your secrets.toml gsheet file!")
 
 
 def load_lottie(filename):
     try:
         with open(filename, 'r') as file:
             return json.load(file)
-    
+
     except FileNotFoundError:
         print(f"Error: The file '{filename}' was not found.")
     except json.JSONDecodeError:
@@ -33,33 +57,86 @@ def load_lottie(filename):
 # Assets
 ANIM_URL = "animebot.json"
 
-SURVEY_CONFIG = [
-    {"id": "name", "q": "I'm Sirosri! What's your name?", "type": "personalized"},
-    {"id": "phone", "q": "What is your phone number?", "type": "straight"},
-    {"id": "hobby", "q": "What's a hobby that makes you lose track of time?", "type": "personalized"},
-]
+SURVEY_CONFIG = {
+    "system_prompt": """
+        You are Sirosri, a friendly AI interviewer. 
+        Your goal is to talk to founders and figure out following-
+        1) business ideas
+            1.1) brand/product
+            1.2) purpose of business
+            1.3) story behind the product
+            1.4) current challenges
+        2) customers / target audience
+            2.1) possible first customer
+            2.2) customer problem area we are trying to solve
+            2.3) what you want for customer
+            2.4) targetting to online/offline user
+        3) founders's lens 
+            3.1) If someone asks “what do you do,” how do you want to answer? 
+            3.2) What do you want to be known for as a founder?
+            3.3) Share 1–2 personal stories that you think connect to your product.
+            3.4) Is there anything you absolutely don’t want your brand to say or look like?
+        4) Branding & Product Personality
+            4.1) Which of these feels closest to you: bold, helpful, visionary, fun, serious, empathetic?
+            4.2) Do you admire any brand — big or small — for how they present themselves?
+            4.3) If your product was a person, how would they talk? (warm, smart, cheeky, calm?)
+        5) Future Vision and Constraints
+            5.1) What’s the one outcome you’d like to see in the next 30 days?
+            5.2) How much time and money can you put behind this right now?
+            5.3) Do you want us to show your story publicly (as testimonials, case studies)?
+            5.4) Where do you want all the deliverables stored (Google Docs, Notion, Figma)?
+        6) Feedback & Iterations
+            6.1) How do you like to give feedback — written, calls, quick yes/no?
+            6.2) Who else (if anyone) will review before approval?
+            6.3) What’s your review timeline comfort — fast and rough, or slow and polished?
+        
+        Use natural conversation. Ask one question at a time based on their responses. 
+        Start with a greeting and ask about their name or interests. 
+        Follow up with deeper questions based on what they share. 
+        Be conversational and show genuine interest.
+        Wrap up all of it between 35 to 40 questions and wrap upwith a warm closing and next steps.
+        """,
+    "max_questions": 40,
+}
 
 # --- SESSION LOGIC ---
 if "step" not in st.session_state:
     st.session_state.step, st.session_state.answers, st.session_state.history = 0, {}, []
-    st.session_state.chat = client.chats.create(model='gemini-2.0-flash')
+    # Initialize conversation with system context
+    st.session_state.chat_context = SURVEY_CONFIG["system_prompt"]
+    # make sure we have a working chat instance for the very first question
+    _init_genai()
 
 # --- UI ---
 with st.sidebar:
     st_lottie(load_lottie(ANIM_URL), height=150)
     st.title("Sirosri")
-    if st.button("🔄 Restart"): 
+    if st.button("🔄 Restart"):
         for k in list(st.session_state.keys()): del st.session_state[k]
         st.rerun()
 
 # --- INTERVIEW FLOW ---
-if st.session_state.step < len(SURVEY_CONFIG):
+if st.session_state.step < SURVEY_CONFIG["max_questions"]:
+    # If no history yet, ask the opening question
     if not st.session_state.history or st.session_state.history[-1]["role"] == "user":
-        curr = SURVEY_CONFIG[st.session_state.step]
-        prompt = f"Ask: {curr['q']}. Mode: {curr['type']}. Context: {st.session_state.answers}"
-        response = st.session_state.chat.send_message(prompt).text
+        if len(st.session_state.history) == 0:
+            # First message - ask opening question
+            prompt = f"{SURVEY_CONFIG['system_prompt']} Start the conversation now with a warm greeting and opening question."
+        else:
+            # Follow-up: generate next question based on user's response
+            user_message = st.session_state.history[-1]["content"]
+            prompt = f"{SURVEY_CONFIG['system_prompt']}\n\nUser just said: \"{user_message}\"\n\nAsk a thoughtful follow-up question based on what they shared. Keep it natural and conversational."
+
+        try:
+            response = _init_genai().send_message(prompt).text
+        except Exception as err:
+            st.warning("Reinitializing AI client due to closed connection…")
+            if "chat" in st.session_state:
+                del st.session_state.chat
+            response = _init_genai().send_message(prompt).text
+
         st.session_state.history.append({"role": "assistant", "content": response})
-        
+
         # Audio
         tts = gTTS(text=response, lang='en')
         fp = io.BytesIO(); tts.write_to_fp(fp)
@@ -71,37 +148,24 @@ if st.session_state.step < len(SURVEY_CONFIG):
 
     # User Inputs
     u_text = st.chat_input("Type here...")
-    u_audio = st.audio_input("Record voice")
 
-    user_val = None
-    if u_audio:
-        with st.spinner("Sirosri is listening..."):
-            res = client.models.generate_content(
-                model='gemini-2.0-flash',
-                contents=[
-                    u_audio.getvalue(),
-                    "Transcribe this audio exactly, including speaker labels and timestamps."
-                ]
-            )
-            # res = model.generate_content(["Transcribe:", {"mime_type": "audio/wav", "data": u_audio.getvalue()}])
-            user_val = res.text
-    elif u_text:
-        user_val = u_text
-
-    if user_val:
-        st.session_state.answers[SURVEY_CONFIG[st.session_state.step]['id']] = user_val
-        st.session_state.history.append({"role": "user", "content": user_val})
+    if u_text:
+        st.session_state.answers[f"response_{st.session_state.step}"] = u_text
+        st.session_state.history.append({"role": "user", "content": u_text})
         st.session_state.step += 1
         st.rerun()
 else:
     # --- ENDING & DATABASE ---
     st.success("Interview Complete!")
     if "saved" not in st.session_state:
-        df = conn.read(worksheet="Sheet1")
+        #df = conn.read(worksheet="Sheet1")
+        df = pd.DataFrame([st.session_state.answers])
         new_row = pd.DataFrame([st.session_state.answers])
         new_row['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        conn.update(worksheet="Sheet1", data=pd.concat([df, new_row]))
+        #conn.update(worksheet="Sheet1", data=pd.concat([df, new_row]))
+        df = pd.concat([df, new_row])
         st.session_state.saved = True
-    
-    st.json(st.session_state.answers)
-    # (PDF & Share Link logic from previous step goes here)
+
+        st.json(st.session_state.answers)
+        st.json(st.session_state.history)
+        # (PDF & Share Link logic from previous step goes here)
