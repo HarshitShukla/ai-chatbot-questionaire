@@ -6,3 +6,7 @@ gTTS
 pandas
 fpdf2
 st-gsheets-connection
+streamlit-mic-recorder
+SpeechRecognition
+librosa
+soundfile
